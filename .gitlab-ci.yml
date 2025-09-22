@@ -1,252 +1,36 @@
 stages:
-  - scan
+  - extract
 
 variables:
-  AZURE_CLOUD: "AzureCloud"
+  LOCATION: "eastus"
 
-aks-version-scan:
+extract_aks_versions:
+  stage: extract
   image: mcr.microsoft.com/azure-cli:2.64.0
-  stage: scan
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "push"'
-  before_script:
-    - mkdir -p report
-    - az cloud set --name ${AZURE_CLOUD:-AzureCloud}
-    - az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
-    - az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+    - when: always
+  script:
+    - set -euo pipefail
     - |
       if ! command -v jq >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
-          apt-get update -y && apt-get install -y jq && rm -rf /var/lib/apt/lists/*
+          DEBIAN_FRONTEND=noninteractive apt-get update -y | cat
+          DEBIAN_FRONTEND=noninteractive apt-get install -y jq | cat
         elif command -v apk >/dev/null 2>&1; then
           apk add --no-cache jq
-        elif command -v microdnf >/dev/null 2>&1; then
-          microdnf install -y jq && microdnf clean all
         else
-          echo "No supported package manager found to install jq" >&2; exit 1
+          echo "jq is required" >&2; exit 1
         fi
       fi
-  script:
-    - |
-      set -euo pipefail
-
-      echo "Listing AKS clusters in subscription $AZURE_SUBSCRIPTION_ID"
-      az aks list --subscription "$AZURE_SUBSCRIPTION_ID" -o json > report/aks_clusters_raw.json
-
-      # Normalize basic cluster info
-      jq -r '
-        map({
-          name: .name,
-          resourceGroup: .resourceGroup,
-          location: .location,
-          currentVersion: (.kubernetesVersion // .currentKubernetesVersion // ""),
-          autoUpgradeChannel: (.autoUpgradeProfile.upgradeChannel // ""),
-          provisioningState: .provisioningState
-        })
-      ' report/aks_clusters_raw.json > report/aks_clusters_basic.json
-
-      echo "Computing latest patch, node pool versions, and upgrade info per cluster"
-      jq -c '.[]' report/aks_clusters_basic.json | while read -r cluster; do
-        NAME=$(echo "$cluster" | jq -r .name)
-        RG=$(echo "$cluster" | jq -r .resourceGroup)
-        CURR=$(echo "$cluster" | jq -r .currentVersion)
-
-        # Query available upgrades for this cluster
-        UPG=$(az aks get-upgrades -g "$RG" -n "$NAME" -o json)
-
-        CURR_FROM_UPG=$(echo "$UPG" | jq -r '.controlPlaneProfile.kubernetesVersion')
-        CURRENT_VERSION=${CURR:-$CURR_FROM_UPG}
-
-        if [ -z "$CURRENT_VERSION" ] || [ "$CURRENT_VERSION" = "null" ]; then
-          CURRENT_VERSION=""
-        fi
-
-        if [ -n "$CURRENT_VERSION" ]; then
-          MAJOR_MINOR=$(echo "$CURRENT_VERSION" | awk -F. '{print $1 "." $2}')
-        else
-          MAJOR_MINOR=""
-        fi
-
-        # Highest patch for the same minor version (including current)
-        LATEST_SAME_MINOR=$(echo "$UPG" | jq -r --arg mm "$MAJOR_MINOR" '
-          [
-            .controlPlaneProfile.upgrades[]?.kubernetesVersion
-            | select($mm != "" and startswith($mm + "."))
-          ] | (if $mm == "" then [] else . end)
-            | map(.) + [ .controlPlaneProfile.kubernetesVersion ]
-            | unique | sort | last // ""
-        ')
-
-        # Next minor version candidates (greater minor than current), as JSON array
-        NEXT_MINOR_CANDIDATES_JSON=$(echo "$UPG" | jq -c --arg mm "$MAJOR_MINOR" '
-          (
-            if $mm == "" then [] else
-            [
-              .controlPlaneProfile.upgrades[]?.kubernetesVersion
-              | select((. | startswith($mm + ".")) | not)
-            ]
-            end
-          ) | unique | sort
-        ')
-
-        NEW_MINOR_AVAILABLE=$(echo "$NEXT_MINOR_CANDIDATES_JSON" | jq 'length > 0')
-        NEW_MINOR_AVAILABLE=$(echo "$NEW_MINOR_AVAILABLE" | tr -d '\n\r')
-
-        AUTO_CHANNEL=$(echo "$cluster" | jq -r '.autoUpgradeChannel')
-
-        # Node pool versions
-        NODEPOOLS=$(az aks nodepool list -g "$RG" --cluster-name "$NAME" -o json | jq '[.[] | {name: .name, mode: .mode, orchestratorVersion: .orchestratorVersion}]')
-
-        jq -n --argjson base "$cluster" \
-              --arg currentVersion "$CURRENT_VERSION" \
-              --arg latestSameMinor "$LATEST_SAME_MINOR" \
-              --argjson nextMinorCandidates "$NEXT_MINOR_CANDIDATES_JSON" \
-              --argjson newMinorAvailable "$NEW_MINOR_AVAILABLE" \
-              --arg autoUpgradeChannel "$AUTO_CHANNEL" \
-              --argjson nodepools "$NODEPOOLS" '
-          $base + {
-            currentVersion: $currentVersion,
-            latestPatchSameMinor: $latestSameMinor,
-            newMinorAvailable: $newMinorAvailable,
-            nextMinorVersions: $nextMinorCandidates,
-            autoUpgradeChannel: $autoUpgradeChannel,
-            nodePools: $nodepools
-          }
-        '
-      done | jq -s '.' > report/aks_versions.json
-
-      # CSV summary (control plane only)
-      jq -r '
-        (["name","resourceGroup","location","currentVersion","latestPatchSameMinor","newMinorAvailable","autoUpgradeChannel"] | @csv),
-        (.[] | [
-          .name, .resourceGroup, .location,
-          .currentVersion, .latestPatchSameMinor,
-          (if .newMinorAvailable then "true" else "false" end),
-          .autoUpgradeChannel
-        ] | @csv)
-      ' report/aks_versions.json > report/aks_versions.csv
-
-      echo "Report written to report/aks_versions.json and report/aks_versions.csv"
- 
-      echo "Building AKS inventory with node pools and VMSS image versions"
-      jq -c '.[]' report/aks_clusters_basic.json | while read -r cluster; do
-        NAME=$(echo "$cluster" | jq -r .name)
-        RG=$(echo "$cluster" | jq -r .resourceGroup)
- 
-        CLUSTER_SHOW=$(az aks show -g "$RG" -n "$NAME" -o json)
-        NODE_RG=$(echo "$CLUSTER_SHOW" | jq -r .nodeResourceGroup)
- 
-        UPG=$(az aks get-upgrades -g "$RG" -n "$NAME" -o json)
-        CURR=$(echo "$cluster" | jq -r .currentVersion)
-        CURR_FROM_UPG=$(echo "$UPG" | jq -r '.controlPlaneProfile.kubernetesVersion')
-        CURRENT_VERSION=${CURR:-$CURR_FROM_UPG}
-        if [ -z "$CURRENT_VERSION" ] || [ "$CURRENT_VERSION" = "null" ]; then
-          CURRENT_VERSION=""
-        fi
-        if [ -n "$CURRENT_VERSION" ]; then
-          MAJOR_MINOR=$(echo "$CURRENT_VERSION" | awk -F. '{print $1 "." $2}')
-        else
-          MAJOR_MINOR=""
-        fi
-        LATEST_SAME_MINOR=$(echo "$UPG" | jq -r --arg mm "$MAJOR_MINOR" '
-          [
-            .controlPlaneProfile.upgrades[]?.kubernetesVersion
-            | select($mm != "" and startswith($mm + "."))
-          ] | (if $mm == "" then [] else . end)
-            | map(.) + [ .controlPlaneProfile.kubernetesVersion ]
-            | unique | sort | last // ""
-        ')
-        NEXT_MINOR_CANDIDATES_JSON=$(echo "$UPG" | jq -c --arg mm "$MAJOR_MINOR" '
-          (
-            if $mm == "" then [] else
-            [
-              .controlPlaneProfile.upgrades[]?.kubernetesVersion
-              | select((. | startswith($mm + ".")) | not)
-            ]
-            end
-          ) | unique | sort
-        ')
-        NEW_MINOR_AVAILABLE=$(echo "$NEXT_MINOR_CANDIDATES_JSON" | jq 'length > 0')
-        NEW_MINOR_AVAILABLE=$(echo "$NEW_MINOR_AVAILABLE" | tr -d '\n\r')
- 
-        NODEPOOLS=$(az aks nodepool list -g "$RG" --cluster-name "$NAME" -o json | jq '[.[] | {
-          name: .name,
-          mode: .mode,
-          count: .count,
-          vmSize: .vmSize,
-          osType: .osType,
-          osSKU: (.osSKU // ""),
-          osDiskType: .osDiskType,
-          osDiskSizeGB: .osDiskSizeGB,
-          enableAutoScaling: .enableAutoScaling,
-          minCount: (.minCount // 0),
-          maxCount: (.maxCount // 0),
-          nodeLabels: (.nodeLabels // {}),
-          nodeTaints: (.nodeTaints // []),
-          maxPods: (.maxPods // 0),
-          orchestratorVersion: .orchestratorVersion,
-          nodeImageVersion: (.nodeImageVersion // ""),
-          upgradeSettings: (.upgradeSettings // {}),
-          availabilityZones: (.availabilityZones // []),
-          scaleSetPriority: (.scaleSetPriority // ""),
-          scaleSetEvictionPolicy: (.scaleSetEvictionPolicy // "")
-        }]')
- 
-        VMSS_JSON="[]"
-        if [ -n "$NODE_RG" ] && [ "$NODE_RG" != "null" ]; then
-          VMSS_JSON=$(az vmss list -g "$NODE_RG" -o json | jq '[.[] | {
-            name: .name,
-            skuName: (.sku.name // ""),
-            capacity: (.sku.capacity // 0),
-            upgradePolicyMode: (.upgradePolicy.mode // ""),
-            tags: (.tags // {}),
-            imageReference: (.virtualMachineProfile.storageProfile.imageReference // {})
-          }]')
-        fi
- 
-        jq -n \
-          --argjson basic "$cluster" \
-          --argjson clusterShow "$CLUSTER_SHOW" \
-          --arg currentVersion "$CURRENT_VERSION" \
-          --arg latestPatchSameMinor "$LATEST_SAME_MINOR" \
-          --argjson nextMinorCandidates "$NEXT_MINOR_CANDIDATES_JSON" \
-          --argjson newMinorAvailable "$NEW_MINOR_AVAILABLE" \
-          --argjson nodepools "$NODEPOOLS" \
-          --argjson vmss "$VMSS_JSON" '
-          {
-            name: $basic.name,
-            resourceGroup: $basic.resourceGroup,
-            location: $basic.location,
-            cluster: {
-              id: ($clusterShow.id // null),
-              kubernetesVersion: ($clusterShow.kubernetesVersion // null),
-              dnsPrefix: ($clusterShow.dnsPrefix // null),
-              nodeResourceGroup: ($clusterShow.nodeResourceGroup // null),
-              privateCluster: ($clusterShow.apiServerAccessProfile.enablePrivateCluster // null),
-              sku: ($clusterShow.sku // null),
-              networkProfile: ($clusterShow.networkProfile // null),
-              autoUpgradeProfile: ($clusterShow.autoUpgradeProfile // null),
-              powerState: ($clusterShow.powerState // null)
-            },
-            versionPattern: {
-              currentVersion: $currentVersion,
-              latestPatchSameMinor: $latestPatchSameMinor,
-              newMinorAvailable: $newMinorAvailable,
-              nextMinorVersions: $nextMinorCandidates
-            },
-            nodePools: $nodepools,
-            vmScaleSets: $vmss
-          }
-        '
-      done | jq -s '.' > report/aks_inventory.json
- 
-      echo "Inventory written to report/aks_inventory.json"
+    - az aks get-versions --location "$LOCATION" -o json \
+        | jq '{
+            versions: [.orchestrators[] | select(.isPreview != true) | .orchestratorVersion],
+            patterns: ([.orchestrators[] | select(.isPreview != true) | .orchestratorVersion
+                        | split(".") | .[0:2] | join(".")] | unique | sort)
+          }' \
+        | tee aks_versions.json
   artifacts:
     when: always
     paths:
-      - report/aks_versions.json
-      - report/aks_versions.csv
-  after_script:
-    - az logout || true
-  timeout: 30m
+      - aks_versions.json
+    expire_in: 1 week
