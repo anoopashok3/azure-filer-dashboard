@@ -1,36 +1,197 @@
+# GitLab CI pipeline to collect AKS versions per region, cluster details, and next available versions
+#
+# REQUIRED CI/CD VARIABLES (set in GitLab -> Settings -> CI/CD -> Variables):
+# - AZURE_TENANT_ID: Azure AD tenant ID
+# - AZURE_CLIENT_ID: Service Principal (app) ID
+# - AZURE_CLIENT_SECRET: Service Principal password/secret (mask & protect)
+# - AZURE_SUBSCRIPTION_ID: Azure subscription ID to query
+#
+# OUTPUT: An artifact file `aks_report.json` with the full JSON report
+
 stages:
-  - extract
+  - report
 
-variables:
-  LOCATION: "eastus"
-
-extract_aks_versions:
-  stage: extract
-  image: mcr.microsoft.com/azure-cli:2.64.0
-  rules:
-    - when: always
-  script:
-    - set -euo pipefail
+aks-versions-and-clusters-report:
+  stage: report
+  image: mcr.microsoft.com/azure-cli:latest
+  variables:
+    AZURE_CORE_ONLY_SHOW_ERRORS: "True"
+  before_script:
+    - az version | cat
+    - apt-get update -y && apt-get install -y jq ca-certificates && update-ca-certificates
     - |
-      if ! command -v jq >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then
-          DEBIAN_FRONTEND=noninteractive apt-get update -y | cat
-          DEBIAN_FRONTEND=noninteractive apt-get install -y jq | cat
-        elif command -v apk >/dev/null 2>&1; then
-          apk add --no-cache jq
-        else
-          echo "jq is required" >&2; exit 1
-        fi
+      set -euo pipefail
+      if [ -z "${AZURE_TENANT_ID:-}" ] || [ -z "${AZURE_CLIENT_ID:-}" ] || [ -z "${AZURE_CLIENT_SECRET:-}" ] || [ -z "${AZURE_SUBSCRIPTION_ID:-}" ]; then
+        echo "Missing one or more required Azure credentials: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_SUBSCRIPTION_ID" >&2
+        exit 1
       fi
-    - az aks get-versions --location "$LOCATION" -o json \
-        | jq '{
-            versions: [.orchestrators[] | select(.isPreview != true) | .orchestratorVersion],
-            patterns: ([.orchestrators[] | select(.isPreview != true) | .orchestratorVersion
-                        | split(".") | .[0:2] | join(".")] | unique | sort)
-          }' \
-        | tee aks_versions.json
+      az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" 1>/dev/null
+      az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+  script:
+    - |
+      set -euo pipefail
+
+      REPORT_FILE="aks_report.json"
+      GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      # Gather canonical region names (e.g., eastus, westeurope). We'll attempt get-versions and skip unsupported regions.
+      mapfile -t ALL_REGIONS < <(az account list-locations -o tsv --query '[].name')
+
+      echo "Collecting AKS versions by region..." >&2
+      REGIONS_JSON='[]'
+      for REGION in "${ALL_REGIONS[@]}"; do
+        # Try to get versions for the region; skip if not supported
+        if ! VERS_RAW=$(az aks get-versions --location "$REGION" -o json 2>/dev/null); then
+          continue
+        fi
+
+        # Normalize various possible shapes returned by az across versions
+        VERSIONS=$(jq -c '
+          def norm_entries:
+            if has("orchestrators") then .orchestrators
+            elif has("values") then .values
+            else [] end;
+          def to_item:
+            {
+              version: (.orchestratorVersion // .version // .kubernetesVersion // null),
+              isPreview: (.isPreview // .is_preview // false),
+              isDefault: (.default // false),
+              publishedDate: (
+                if has("patchVersions") and (.orchestratorVersion // .version // .kubernetesVersion) then
+                  (.patchVersions[.orchestratorVersion // .version // .kubernetesVersion].releaseDate // null)
+                elif has("patches") then
+                  # Some shapes provide per-patch metadata; if present try to match by version
+                  (
+                    [ .patches[]? | select((.version // .kubernetesVersion // "") == (.version // .kubernetesVersion // "")) | .releaseDate ]
+                    | first // null
+                  )
+                else null end
+              )
+            } | select(.version != null)
+          ;
+          norm_entries | map(to_item)
+          | map(. + { pattern: ((.version | split(".") | .[0:2] | join(".")) + ".x") })
+          | unique_by(.version)
+        ' <<<"$VERS_RAW")
+
+        if [ -z "$VERSIONS" ] || [ "$VERSIONS" = "null" ]; then
+          continue
+        fi
+
+        DEFAULT_VERSION=$(jq -r 'map(select(.isDefault == true)) | (.[0].version // null)' <<<"$VERSIONS")
+
+        REGION_ENTRY=$(jq -c --arg region "$REGION" --arg default_version "${DEFAULT_VERSION:-}" --argjson versions "$VERSIONS" '
+          {
+            name: $region,
+            defaultVersion: ($default_version | select(. != "")) ,
+            versions: $versions
+          }
+        ')
+
+        REGIONS_JSON=$(jq -c --argjson item "$REGION_ENTRY" '. + [$item]' <<<"$REGIONS_JSON")
+      done
+
+      echo "Collecting AKS cluster details and upgrade candidates..." >&2
+      CLUSTERS_RAW=$(az aks list -o json)
+      # If there are no clusters, ensure we still output a consistent JSON
+      if [ -z "$CLUSTERS_RAW" ] || [ "$CLUSTERS_RAW" = "null" ]; then
+        CLUSTERS_RAW='[]'
+      fi
+
+      # Build base cluster list with core properties we care about
+      BASE_CLUSTERS=$(jq -c '
+        map({
+          name,
+          id,
+          resourceGroup: .resourceGroup,
+          location,
+          kubernetesVersion: .kubernetesVersion,
+          currentVersionPattern: ((.kubernetesVersion // "" | split(".") | .[0:2] | join(".")) + (if .kubernetesVersion then ".x" else "" end)),
+          skuTier: (.sku.tier // null),
+          networkPlugin: (.networkProfile.networkPlugin // null),
+          nodeResourceGroup: (.nodeResourceGroup // null),
+          privateCluster: (.apiServerAccessProfile.enablePrivateCluster // false),
+          oidcIssuerEnabled: (.oidcIssuerProfile.enabled // false),
+          httpProxyEnabled: (.httpProxyConfig.enabled // false),
+          nodePools: [
+            .agentPoolProfiles[]? | {
+              name: .name,
+              vmSize: .vmSize,
+              count: .count,
+              osType: .osType,
+              osSKU: .osSKU,
+              mode: .mode,
+              orchestratorVersion: .orchestratorVersion,
+              enableAutoScaling: .enableAutoScaling,
+              minCount: .minCount,
+              maxCount: .maxCount
+            }
+          ]
+        })
+      ' <<<"$CLUSTERS_RAW")
+
+      # Iterate clusters to fetch upgrade candidates; merge results
+      CLUSTERS_WITH_UPGRADES='[]'
+      CLUSTER_COUNT=$(jq 'length' <<<"$BASE_CLUSTERS")
+      for ((i=0; i<CLUSTER_COUNT; i++)); do
+        ITEM=$(jq -c ".[$i]" <<<"$BASE_CLUSTERS")
+        NAME=$(jq -r '.name' <<<"$ITEM")
+        RG=$(jq -r '.resourceGroup' <<<"$ITEM")
+        CURR=$(jq -r '.kubernetesVersion // empty' <<<"$ITEM")
+
+        UPGRADES_JSON=$(az aks get-upgrades -g "$RG" -n "$NAME" -o json 2>/dev/null || echo '{}')
+        CANDIDATES=$(jq -c '[.controlPlaneProfile.upgrades[]?.kubernetesVersion] // []' <<<"$UPGRADES_JSON")
+
+        # Compute next patch and next minor from candidates
+        NEXT_JSON=$(jq -c --arg curr "$CURR" --argjson candidates "$CANDIDATES" '
+          def vparts($v): ($v | split(".")) as $s | [ ($s[0]|tonumber), ($s[1]|tonumber), (($s[2] // "0")|tonumber) ];
+          def vkey: split(".") | [ (.[0]|tonumber), (.[1]|tonumber), ((.[2] // "0")|tonumber) ];
+
+          . as $in | ($curr // "") as $c
+          | ($c | split(".") | [ (.[0]|tonumber), (.[1]|tonumber) ]) as $cm
+          | ($c | select(. != "") | split(".") | vparts(.)) as $cv
+          | ($c | select(. == "") ) as $empty
+
+          | ($candidates // []) as $all
+          | $all
+          | map(select(type=="string"))
+          | map(select(. != $c))
+          | (
+              map(select((split(".") | [ (.[0]|tonumber), (.[1]|tonumber) ]) == $cm))
+            ) as $patches
+          | (
+              map(select((split(".") | [ (.[0]|tonumber), (.[1]|tonumber) ]) != $cm))
+            ) as $minors
+          | {
+              patchCandidates: ($patches | sort_by(vkey)),
+              minorCandidates: ($minors | sort_by(vkey)),
+              nextPatch: (($patches | sort_by(vkey) | .[0]) // null),
+              nextMinor: (($minors | sort_by(vkey) | .[0]) // null)
+            }
+        ' <<<"{}")
+
+        MERGED=$(jq -c --argjson item "$ITEM" --argjson next "$NEXT_JSON" '$item + { upgradeCandidates: $next }')
+        CLUSTERS_WITH_UPGRADES=$(jq -c --argjson m "$MERGED" '. + [$m]' <<<"$CLUSTERS_WITH_UPGRADES")
+      done
+
+      # Compose final report
+      SUB_ID=$(az account show --query id -o tsv)
+      FINAL=$(jq -c --arg sub "$SUB_ID" --arg gen "$GENERATED_AT" --argjson regions "$REGIONS_JSON" --argjson clusters "$CLUSTERS_WITH_UPGRADES" '
+        {
+          subscriptionId: $sub,
+          generatedAt: $gen,
+          regions: $regions,
+          clusters: $clusters
+        }
+      ' <<<"{}")
+
+      echo "$FINAL" | jq '.' > "$REPORT_FILE"
+      echo "Wrote report to $REPORT_FILE" >&2
   artifacts:
     when: always
+    expose_as: "AKS Versions Report"
     paths:
-      - aks_versions.json
-    expire_in: 1 week
+      - aks_report.json
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
